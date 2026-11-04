@@ -1,0 +1,7 @@
+discord.py[voice]==2.7.1
+# davey 0.2.0 needs prepare/execute_transition calls that discord.py 2.7.1 never makes,
+# so voice encryption never gets a key and Discord drops all audio.
+davey==0.1.7
+yt-dlp==2026.10.26
+yt-dlp-ejs==0.8.0
+python-dotenv==1.2.4
