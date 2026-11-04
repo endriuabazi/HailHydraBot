@@ -1,0 +1,7 @@
+services:
+  hydra:
+    build: .
+    image: hydra-bot
+    container_name: hydra
+    env_file: .env
+    restart: unless-stopped

@@ -6,6 +6,7 @@ import os
 import random
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import discord
 import yt_dlp
@@ -19,13 +20,17 @@ log = logging.getLogger("hydra")
 MAX_PLAYLIST_ITEMS = 50
 IDLE_TIMEOUT_SECONDS = 300
 
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"}
+
 # Base options shared by search and stream resolution.
 # YouTube needs a JS runtime to solve its signature challenges; Node is used here.
+# Only YouTube extractors are loaded, so yt-dlp never fetches arbitrary sites
+# (e.g. internal network addresses) on a user's behalf.
 _BASE_YTDL = {
     "quiet": True,
     "no_warnings": True,
-    "default_search": "ytsearch",
     "js_runtimes": {"node": {}},
+    "allowed_extractors": ["youtube.*"],
 }
 SEARCH_OPTS = {**_BASE_YTDL, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST_ITEMS}
 STREAM_OPTS = {**_BASE_YTDL, "format": "bestaudio/best", "noplaylist": True}
@@ -50,6 +55,20 @@ class Track:
         m, s = divmod(int(self.duration), 60)
         h, m = divmod(m, 60)
         return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+
+
+def _to_ytdl_query(query: str) -> str | None:
+    """Return a YouTube URL or an explicit YouTube search; None for non-YouTube links."""
+    query = query.strip()
+    looks_like_url = "://" in query or query.lower().startswith(("www.", "youtube.com", "youtu.be", "m.youtube.com"))
+    if not looks_like_url:
+        # Explicit prefix so yt-dlp never guesses that plain text like "example.com" is a URL.
+        return f"ytsearch1:{query}"
+    url = query if "://" in query else f"https://{query}"
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or (parsed.hostname or "").lower() not in YOUTUBE_HOSTS:
+        return None
+    return url
 
 
 def _search(query: str) -> list[dict]:
@@ -163,7 +182,12 @@ class Hydra(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True  # needed to read "h!" commands
         # A unique prefix so Hydra doesn't clash with other bots that use "!".
-        super().__init__(command_prefix=["h!", "H!"], intents=intents)
+        # No pings: video titles and names are user-controlled and could contain @everyone.
+        super().__init__(
+            command_prefix=["h!", "H!"],
+            intents=intents,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         self.players: dict[int, GuildPlayer] = {}
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
@@ -196,6 +220,8 @@ class Hydra(commands.Bot):
             await ctx.send(f"Invalid value. Usage: {usage}")
         elif isinstance(error, commands.NoPrivateMessage):
             await ctx.send("Use Hydra commands in a server.")
+        elif isinstance(error, NotInBotVoiceChannel):
+            await ctx.send(str(error))
         else:
             log.error("Command %s failed", ctx.command, exc_info=error)
             await ctx.send("Something went wrong running that command.")
@@ -208,6 +234,25 @@ def _player_or_none(ctx: commands.Context) -> GuildPlayer | None:
     return bot.players.get(ctx.guild.id) if ctx.guild else None
 
 
+class NotInBotVoiceChannel(commands.CheckFailure):
+    pass
+
+
+def in_bot_voice_channel():
+    """Only members in Hydra's voice channel may control playback."""
+
+    async def predicate(ctx: commands.Context) -> bool:
+        vc = ctx.guild.voice_client if ctx.guild else None
+        if vc is None:
+            return True  # nothing to control; the command reports that itself
+        voice = getattr(ctx.author, "voice", None)
+        if not voice or voice.channel != vc.channel:
+            raise NotInBotVoiceChannel(f"Join {vc.channel.mention} to control playback.")
+        return True
+
+    return commands.check(predicate)
+
+
 @bot.hybrid_command(aliases=["p"], help="Play a song or playlist from YouTube (URL or search terms)")
 @app_commands.describe(query="YouTube URL or search terms")
 @commands.guild_only()
@@ -216,13 +261,22 @@ async def play(ctx: commands.Context, *, query: str) -> None:
     if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
         await ctx.send("Join a voice channel first.")
         return
-    # Slash commands must be answered within 3 seconds; joining voice and searching can take longer.
-    await ctx.defer()
+    ytdl_query = _to_ytdl_query(query)
+    if ytdl_query is None:
+        await ctx.send("Only YouTube links are supported. You can also type search terms.")
+        return
 
     player = bot.player(ctx.guild)
+    vc = player.vc
+    # Don't pull Hydra away from people who are listening in another channel.
+    if vc and vc.channel != member.voice.channel and (player.current or player.queue):
+        await ctx.send(f"I'm already playing in {vc.channel.mention}. Join it to add songs.")
+        return
+
+    # Slash commands must be answered within 3 seconds; joining voice and searching can take longer.
+    await ctx.defer()
     player.channel = ctx.channel
 
-    vc = player.vc
     if not vc:
         vc = await member.voice.channel.connect(self_deaf=True)
     elif vc.channel != member.voice.channel:
@@ -230,7 +284,7 @@ async def play(ctx: commands.Context, *, query: str) -> None:
 
     async with ctx.typing():
         try:
-            entries = await asyncio.to_thread(_search, query)
+            entries = await asyncio.to_thread(_search, ytdl_query)
         except Exception as e:
             log.warning("Search failed for %r: %s", query, e)
             await ctx.send("Could not find anything for that query.")
@@ -263,6 +317,7 @@ async def play(ctx: commands.Context, *, query: str) -> None:
 
 @bot.hybrid_command(aliases=["s"], help="Skip the current track")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def skip(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
     if not player or not player.vc or not (player.vc.is_playing() or player.vc.is_paused()):
@@ -274,6 +329,7 @@ async def skip(ctx: commands.Context) -> None:
 
 @bot.hybrid_command(help="Pause playback")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def pause(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
     if not player or not player.vc or not player.vc.is_playing():
@@ -285,6 +341,7 @@ async def pause(ctx: commands.Context) -> None:
 
 @bot.hybrid_command(help="Resume playback")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def resume(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
     if not player or not player.vc or not player.vc.is_paused():
@@ -296,6 +353,7 @@ async def resume(ctx: commands.Context) -> None:
 
 @bot.hybrid_command(help="Stop playback, clear the queue, and leave")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def stop(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
     if not player or not player.vc:
@@ -337,6 +395,7 @@ async def nowplaying(ctx: commands.Context) -> None:
 @bot.hybrid_command(aliases=["vol"], help="Set volume (0-100)")
 @app_commands.describe(level="Volume from 0 to 100")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def volume(ctx: commands.Context, level: int) -> None:
     if not 0 <= level <= 100:
         await ctx.send("Volume must be between 0 and 100.")
@@ -350,6 +409,7 @@ async def volume(ctx: commands.Context, level: int) -> None:
 
 @bot.hybrid_command(help="Shuffle the queue")
 @commands.guild_only()
+@in_bot_voice_channel()
 async def shuffle(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
     if not player or len(player.queue) < 2:

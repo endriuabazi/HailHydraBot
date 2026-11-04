@@ -13,6 +13,8 @@ Every command works two ways: as a slash command (`/play`) and as a text command
 - Separate queue for each server
 - Leaves the voice channel after 5 minutes with nothing playing
 - Supports Discord's end-to-end encrypted voice (DAVE)
+- Runs in Docker, or directly with Python
+- Built-in safeguards: opens YouTube links only, never pings anyone, and only listeners can control playback
 
 ## Commands
 
@@ -31,6 +33,10 @@ Every command works two ways: as a slash command (`/play`) and as a text command
 
 Notes:
 - Join a voice channel before you use `play`.
+- `play` accepts YouTube links (youtube.com, youtu.be, music.youtube.com) or search terms. Links to other sites are refused.
+- To use `skip`, `pause`, `resume`, `stop`, `volume` or `shuffle`, you must be in the same voice channel as Hydra.
+- While Hydra is playing for people in one channel, `play` from another channel won't move it there. Join its channel to add songs.
+- `queue` and `nowplaying` work from anywhere.
 - Commands work only in servers, not in DMs.
 - The text prefix is `h!` (or `H!`), so it doesn't clash with other bots that use `!`.
 
@@ -44,6 +50,10 @@ h!vol 30
 ```
 
 ## Requirements
+
+To run with Docker, you need only [Docker](https://docs.docker.com/get-docker/) with Docker Compose. The image includes Python, FFmpeg and Node.js. Do setup steps 1, 2 and 4. In step 3, only clone the repo, and skip the virtual environment and `pip` steps. Then go to [Running with Docker](#running-with-docker).
+
+To run directly with Python, you need:
 
 - [Python](https://www.python.org/downloads/) 3.10 or newer (tested with 3.12)
 - [FFmpeg](https://ffmpeg.org/download.html), available on your `PATH`
@@ -122,7 +132,27 @@ To find your server ID, turn on **Developer Mode** in Discord (User Settings > A
 
 Never commit `.env`. It's already listed in `.gitignore`.
 
-## Running
+## Running with Docker
+
+From the project folder, with `.env` filled in:
+
+```bash
+docker compose up -d --build
+```
+
+| Task | Command |
+|---|---|
+| Start, or rebuild after code changes | `docker compose up -d --build` |
+| See logs | `docker logs -f hydra` |
+| Stop | `docker compose down` |
+| Update yt-dlp (when YouTube breaks) | `docker compose build --no-cache && docker compose up -d` |
+
+- The container restarts by itself after a crash or reboot (`restart: unless-stopped`), as long as Docker is running.
+- `.env` is read when the container starts. It's never copied into the image (see `.dockerignore`).
+- The image runs as a non-root user. It includes FFmpeg and Node.js 22, which `yt-dlp` needs for YouTube.
+- Run only one copy of the bot at a time, either Docker or `python bot.py`. Two copies with the same token answer every command twice.
+
+## Running with Python
 
 With the virtual environment active:
 
@@ -136,7 +166,7 @@ When it's ready, you'll see:
 INFO     hydra: Hydra is online as Hydra#1234
 ```
 
-Hydra stays online only while this process runs. To keep it online all the time, run it on a machine that stays on, such as a VPS or a Raspberry Pi. Use a process manager like `systemd`, `pm2` or `nssm` (Windows) to restart it if it crashes.
+Hydra stays online only while this process runs. To keep it online all the time, use Docker, or run it with a process manager such as `systemd` or `nssm` (Windows). Either way, run it on a machine that stays on, such as a VPS or a Raspberry Pi.
 
 ## How it works
 
@@ -164,13 +194,23 @@ track ends  --->  play_next() starts the next track
 - **Idle timeout.** When the queue runs out, a 5-minute timer starts. If nothing plays before it ends, Hydra leaves the channel.
 - **Encrypted voice.** Discord encrypts voice end to end (the DAVE protocol). `discord.py` handles this through the `davey` package.
 
+### Security
+
+- **Only YouTube is fetched.** Hydra checks every link against a list of YouTube hosts, and turns plain text into a YouTube search. `yt-dlp` also loads only its YouTube extractors, so a link to any other site fails there too. Without this, a member could make the bot fetch addresses on the host's own network, such as a router's admin page.
+- **No pings.** Hydra sends every message with mentions turned off. A video titled `@everyone` shows as plain text and doesn't notify anyone.
+- **Only listeners control playback.** `skip`, `pause`, `resume`, `stop`, `volume` and `shuffle` work only for members in Hydra's voice channel. `play` can't pull Hydra away from a channel where it's playing.
+- **The token stays out of Git and Docker images.** `.env` is listed in both `.gitignore` and `.dockerignore`.
+
 ## Project structure
 
 ```
 hydra/
-├── bot.py             # The bot: player, commands and startup
-├── requirements.txt   # Pinned Python dependencies
-├── .env.example       # Template for .env
+├── bot.py               # The bot: player, commands and startup
+├── requirements.txt     # Pinned Python dependencies
+├── Dockerfile           # Image with Python 3.12, FFmpeg and Node.js 22
+├── docker-compose.yml   # Runs the container with .env and auto-restart
+├── .dockerignore        # Keeps .env and .venv out of the image
+├── .env.example         # Template for .env
 └── .gitignore
 ```
 
@@ -199,3 +239,7 @@ hydra/
 | `DISCORD_TOKEN is not set` | Create `.env` from `.env.example` and add your token. |
 | FFmpeg not found | Install FFmpeg and add it to your `PATH`, then open a new terminal. |
 | Another bot also answers | Use `/` and choose Hydra from the list, or use the `h!` prefix. |
+| "Join #channel to control playback" | Join Hydra's voice channel, then try again. |
+| "Only YouTube links are supported" | Use a YouTube link, or type the song name as search terms. |
+| Every command gets 2 replies | Two copies of the bot are running, for example Docker and `python bot.py`. Stop one. |
+| Container keeps restarting | Run `docker logs hydra`. Usually `.env` is missing or the token is wrong. |
