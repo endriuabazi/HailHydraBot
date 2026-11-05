@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from collections import deque
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -35,7 +36,21 @@ _BASE_YTDL = {
     "allowed_extractors": ["youtube.*"],
 }
 SEARCH_OPTS = {**_BASE_YTDL, "extract_flat": "in_playlist", "playlistend": MAX_PLAYLIST_ITEMS}
-STREAM_OPTS = {**_BASE_YTDL, "format": "bestaudio/best", "noplaylist": True}
+# On networks YouTube distrusts, the default clients' audio links need a "PO token";
+# without one YouTube answers 403 Forbidden after the first song. The web_safari
+# client's HLS streams don't need one, so prefer them (smallest video, since HLS has
+# no audio-only streams), and fall back to the tv_simply client for other videos.
+STREAM_OPTS = {
+    **_BASE_YTDL,
+    "format": "bestaudio[protocol^=m3u8]/best[protocol^=m3u8][height<=360]/bestaudio/best",
+    "extractor_args": {"youtube": {"player_client": ["web_safari", "tv_simply"]}},
+    "noplaylist": True,
+}
+
+# A song that ends this soon after starting failed to stream (e.g. YouTube refused it).
+MIN_PLAY_SECONDS = 3
+# Stop after this many failed songs in a row instead of skipping through the whole queue.
+MAX_FAILURES_IN_ROW = 3
 
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
@@ -119,6 +134,8 @@ class GuildPlayer:
         self.current: Track | None = None
         self.volume = 0.5
         self.channel: discord.abc.Messageable | None = None
+        self.skipping = False  # set by the skip command, so a quick skip doesn't count as a failure
+        self._failures = 0
         self._idle_task: asyncio.Task | None = None
 
     @property
@@ -143,20 +160,52 @@ class GuildPlayer:
         except Exception as e:
             log.warning("Failed to resolve %s: %s", track.url, e)
             await self._say(f"Could not play **{track.title}**, skipping.")
-            await self.play_next()
+            if not await self._count_failure():
+                await self.play_next()
             return
 
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(stream, **FFMPEG_OPTS), volume=self.volume
         )
+        started = time.monotonic()
 
         def after(err: Exception | None) -> None:
             if err:
                 log.error("Player error: %s", err)
-            asyncio.run_coroutine_threadsafe(self.play_next(), self.bot.loop)
+            elapsed = time.monotonic() - started
+            asyncio.run_coroutine_threadsafe(self._after_track(elapsed), self.bot.loop)
 
         vc.play(source, after=after)
         await self._say(f"Now playing: **{track.title}** [{track.length}] - requested by {track.requester}")
+
+    async def _after_track(self, elapsed: float) -> None:
+        skipped, self.skipping = self.skipping, False
+        vc = self.vc
+        if vc and vc.is_connected() and not skipped and elapsed < MIN_PLAY_SECONDS:
+            # FFmpeg quit almost at once, so the stream was refused (e.g. 403 Forbidden).
+            title = self.current.title if self.current else "that song"
+            log.warning("%s stopped after %.1fs; the stream was probably refused", title, elapsed)
+            await self._say(f"YouTube refused **{title}**, skipping.")
+            if await self._count_failure():
+                return
+        else:
+            self._failures = 0
+        await self.play_next()
+
+    async def _count_failure(self) -> bool:
+        """Count a failed song; after several in a row, stop and return True."""
+        self._failures += 1
+        if self._failures < MAX_FAILURES_IN_ROW:
+            return False
+        self._failures = 0
+        self.queue.clear()
+        self.current = None
+        self._start_idle_timer()
+        await self._say(
+            f"{MAX_FAILURES_IN_ROW} songs in a row failed, so I stopped and cleared the queue. "
+            "YouTube may be refusing downloads right now. Try again later."
+        )
+        return True
 
     async def _say(self, text: str) -> None:
         if self.channel:
@@ -384,6 +433,7 @@ async def skip(ctx: commands.Context) -> None:
     if not player or not player.vc or not (player.vc.is_playing() or player.vc.is_paused()):
         await ctx.send("Nothing is playing.")
         return
+    player.skipping = True
     player.vc.stop()  # triggers the after-callback, which plays the next track
     await ctx.send("Skipped.")
 

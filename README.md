@@ -295,6 +295,7 @@ hydra/
 | `h!` commands do nothing | Turn on **Message Content Intent** on the bot's page in the Developer Portal. |
 | `PrivilegedIntentsRequired` error at startup | Same fix: turn on **Message Content Intent**. |
 | "Could not find anything" or videos fail | YouTube changes often. Update with `pip install -U yt-dlp yt-dlp-ejs`, and check that Node.js is installed. |
+| "YouTube refused ..." or "3 songs in a row failed" | YouTube is blocking downloads from the bot's internet connection (logs show `HTTP error 403 Forbidden`). It happens more on home servers like a Raspberry Pi. Hydra already prefers the download methods that YouTube blocks least (`STREAM_OPTS` in `bot.py`). If it keeps happening, update yt-dlp, or wait a few hours. |
 | `DISCORD_TOKEN is not set` | Create `.env` from `.env.example` and add your token. |
 | FFmpeg not found | Install FFmpeg and add it to your `PATH`, then open a new terminal. |
 | Another bot also answers | Use `/` and choose Hydra from the list, or use the `h!` prefix. |
