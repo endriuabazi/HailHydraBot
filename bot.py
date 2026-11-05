@@ -1,4 +1,4 @@
-"""Hydra - a Discord bot that plays YouTube audio in voice channels."""
+"""Hydra - a Discord bot that plays YouTube audio in voice channels, from YouTube or Spotify links."""
 
 import asyncio
 import logging
@@ -13,6 +13,8 @@ import yt_dlp
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+import spotify
 
 load_dotenv()
 log = logging.getLogger("hydra")
@@ -44,9 +46,10 @@ FFMPEG_OPTS = {
 @dataclass
 class Track:
     title: str
-    url: str
+    url: str  # what yt-dlp resolves: a YouTube URL, or a "ytsearch1:" query for Spotify tracks
     duration: int | None
     requester: str
+    link: str  # shown to users: the YouTube or Spotify page
 
     @property
     def length(self) -> str:
@@ -83,10 +86,19 @@ def _search(query: str) -> list[dict]:
     return [e for e in entries if e]
 
 
-def _stream_url(page_url: str) -> str:
-    """Resolve a fresh direct audio URL (they expire, so resolve at play time)."""
+def _stream_url(target: str) -> str:
+    """Resolve a fresh direct audio URL (they expire, so resolve at play time).
+
+    `target` is a YouTube URL or a "ytsearch1:" query (Spotify tracks are only
+    matched to a YouTube video here, when they start playing).
+    """
     with yt_dlp.YoutubeDL(STREAM_OPTS) as ydl:
-        info = ydl.extract_info(page_url, download=False)
+        info = ydl.extract_info(target, download=False)
+    if "entries" in info:
+        entries = [e for e in info["entries"] if e]
+        if not entries:
+            raise LookupError(f"no YouTube result for {target!r}")
+        info = entries[0]
     return info["url"]
 
 
@@ -189,6 +201,17 @@ class Hydra(commands.Bot):
             allowed_mentions=discord.AllowedMentions.none(),
         )
         self.players: dict[int, GuildPlayer] = {}
+        client_id, client_secret = os.getenv("SPOTIFY_CLIENT_ID"), os.getenv("SPOTIFY_CLIENT_SECRET")
+        self.spotify = (
+            spotify.SpotifyClient(client_id, client_secret, os.getenv("SPOTIFY_REFRESH_TOKEN") or None)
+            if client_id and client_secret
+            else None
+        )
+
+    async def close(self) -> None:
+        if self.spotify:
+            await self.spotify.close()
+        await super().close()
 
     def player(self, guild: discord.Guild) -> GuildPlayer:
         if guild.id not in self.players:
@@ -208,6 +231,11 @@ class Hydra(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Hydra is online as %s", self.user)
+        if self.spotify is None:
+            log.info("Spotify: off (set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to enable)")
+        else:
+            log.info("Spotify: on (%s)", "logged in, playlists enabled" if self.spotify.has_user_login
+                     else "no SPOTIFY_REFRESH_TOKEN, so playlists won't work; run spotify_auth.py")
         await self.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="/play"))
 
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
@@ -253,17 +281,58 @@ def in_bot_voice_channel():
     return commands.check(predicate)
 
 
-@bot.hybrid_command(aliases=["p"], help="Play a song or playlist from YouTube (URL or search terms)")
-@app_commands.describe(query="YouTube URL or search terms")
+class PlayError(Exception):
+    """A problem with the requested song, with a message safe to show in Discord."""
+
+
+async def _find_tracks(query: str, requester: str) -> tuple[str | None, list[Track]]:
+    """Return (name of the album/playlist if any, tracks) for a YouTube/Spotify link or search."""
+    if spotify.is_spotify_link(query):
+        ref = spotify.parse_link(query)
+        if ref is None:
+            raise PlayError("Use a Spotify track, album or playlist link, like `https://open.spotify.com/playlist/...`.")
+        if bot.spotify is None:
+            raise PlayError("Spotify isn't set up on this bot yet. YouTube links and search still work.")
+        try:
+            name, items = await bot.spotify.tracks(*ref, limit=MAX_PLAYLIST_ITEMS)
+        except spotify.SpotifyError as e:
+            log.warning("Spotify lookup failed for %s %s: %s", *ref, e.__cause__ or e)
+            raise PlayError(str(e)) from None
+        tracks = [
+            Track(
+                title=f"{t.artists} - {t.title}" if t.artists else t.title,
+                # Matched to a YouTube video only when it starts playing, so big playlists queue instantly.
+                url=f"ytsearch1:{t.artists} - {t.title}",
+                duration=t.duration,
+                requester=requester,
+                link=t.url,
+            )
+            for t in items
+        ]
+        return (name if ref[0] != "track" else None), tracks
+
+    ytdl_query = _to_ytdl_query(query)
+    if ytdl_query is None:
+        raise PlayError("Only YouTube and Spotify links are supported. You can also type search terms.")
+    try:
+        entries = await asyncio.to_thread(_search, ytdl_query)
+    except Exception as e:
+        log.warning("Search failed for %r: %s", query, e)
+        raise PlayError("Could not find anything for that query.") from None
+    tracks = []
+    for e in entries:
+        url = _entry_url(e)
+        tracks.append(Track(e.get("title") or "Unknown title", url, e.get("duration"), requester, link=url))
+    return None, tracks
+
+
+@bot.hybrid_command(aliases=["p"], help="Play a song or playlist from YouTube or Spotify (link or search terms)")
+@app_commands.describe(query="YouTube or Spotify link, or search terms")
 @commands.guild_only()
 async def play(ctx: commands.Context, *, query: str) -> None:
     member = ctx.author
     if not isinstance(member, discord.Member) or not member.voice or not member.voice.channel:
         await ctx.send("Join a voice channel first.")
-        return
-    ytdl_query = _to_ytdl_query(query)
-    if ytdl_query is None:
-        await ctx.send("Only YouTube links are supported. You can also type search terms.")
         return
 
     player = bot.player(ctx.guild)
@@ -273,41 +342,33 @@ async def play(ctx: commands.Context, *, query: str) -> None:
         await ctx.send(f"I'm already playing in {vc.channel.mention}. Join it to add songs.")
         return
 
-    # Slash commands must be answered within 3 seconds; joining voice and searching can take longer.
+    # Slash commands must be answered within 3 seconds; searching and joining voice can take longer.
     await ctx.defer()
-    player.channel = ctx.channel
 
+    async with ctx.typing():
+        try:
+            collection, tracks = await _find_tracks(query, member.display_name)
+        except PlayError as e:
+            await ctx.send(str(e))
+            return
+    if not tracks:
+        await ctx.send("No results.")
+        return
+
+    player.channel = ctx.channel
+    vc = player.vc
     if not vc:
         vc = await member.voice.channel.connect(self_deaf=True)
     elif vc.channel != member.voice.channel:
         await vc.move_to(member.voice.channel)
 
-    async with ctx.typing():
-        try:
-            entries = await asyncio.to_thread(_search, ytdl_query)
-        except Exception as e:
-            log.warning("Search failed for %r: %s", query, e)
-            await ctx.send("Could not find anything for that query.")
-            return
-    if not entries:
-        await ctx.send("No results.")
-        return
-
-    tracks = [
-        Track(
-            title=e.get("title") or "Unknown title",
-            url=_entry_url(e),
-            duration=e.get("duration"),
-            requester=member.display_name,
-        )
-        for e in entries
-    ]
     player.queue.extend(tracks)
 
-    if len(tracks) == 1:
+    if len(tracks) == 1 and not collection:
         await ctx.send(f"Queued: **{tracks[0].title}** [{tracks[0].length}]")
     else:
-        await ctx.send(f"Queued **{len(tracks)}** tracks.")
+        source = f" from **{collection}**" if collection else ""
+        await ctx.send(f"Queued **{len(tracks)}** tracks{source}.")
 
     # `current` is set before the stream URL resolves, so this also guards
     # against two quick play calls both starting playback.
@@ -389,7 +450,7 @@ async def nowplaying(ctx: commands.Context) -> None:
         await ctx.send("Nothing is playing.")
         return
     t = player.current
-    await ctx.send(f"Now playing: **{t.title}** [{t.length}]\n<{t.url}>")
+    await ctx.send(f"Now playing: **{t.title}** [{t.length}]\n<{t.link}>")
 
 
 @bot.hybrid_command(aliases=["vol"], help="Set volume (0-100)")
