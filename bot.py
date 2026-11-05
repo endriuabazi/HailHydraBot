@@ -52,6 +52,11 @@ MIN_PLAY_SECONDS = 3
 # Stop after this many failed songs in a row instead of skipping through the whole queue.
 MAX_FAILURES_IN_ROW = 3
 
+# The Now playing panel: Discord doesn't update messages live, so Hydra edits it this often.
+PANEL_REFRESH_SECONDS = 15
+PANEL_COLOR = 0x2ECC71
+NOTE_SECONDS = 10  # how long "X skipped" notes from the buttons stay in the chat
+
 FFMPEG_OPTS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn",
@@ -65,14 +70,17 @@ class Track:
     duration: int | None
     requester: str
     link: str  # shown to users: the YouTube or Spotify page
+    thumbnail: str | None = None  # the YouTube video's picture, known once the song is resolved
 
     @property
     def length(self) -> str:
-        if not self.duration:
-            return "live"
-        m, s = divmod(int(self.duration), 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
+        return _fmt_time(self.duration) if self.duration else "live"
+
+
+def _fmt_time(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
 def _to_ytdl_query(query: str) -> str | None:
@@ -101,8 +109,8 @@ def _search(query: str) -> list[dict]:
     return [e for e in entries if e]
 
 
-def _stream_url(target: str) -> str:
-    """Resolve a fresh direct audio URL (they expire, so resolve at play time).
+def _stream_info(target: str) -> dict:
+    """Resolve the video's info, with a fresh direct audio URL in "url" (they expire, so resolve at play time).
 
     `target` is a YouTube URL or a "ytsearch1:" query (Spotify tracks are only
     matched to a YouTube video here, when they start playing).
@@ -114,7 +122,7 @@ def _stream_url(target: str) -> str:
         if not entries:
             raise LookupError(f"no YouTube result for {target!r}")
         info = entries[0]
-    return info["url"]
+    return info
 
 
 def _entry_url(entry: dict) -> str:
@@ -134,21 +142,39 @@ class GuildPlayer:
         self.current: Track | None = None
         self.volume = 0.5
         self.channel: discord.abc.Messageable | None = None
-        self.skipping = False  # set by the skip command, so a quick skip doesn't count as a failure
+        self.skipping = False  # set by skip(), so a quick skip doesn't count as a failure
+        self.paused_by: str | None = None
         self._failures = 0
         self._idle_task: asyncio.Task | None = None
+        # Progress of the current song, for the panel's progress bar.
+        self._play_started: float | None = None
+        self._paused_at: float | None = None
+        self._paused_total = 0.0
+        self._panel: discord.Message | None = None
+        self._controls: PlayerControls | None = None
+        self._panel_task: asyncio.Task | None = None
 
     @property
     def vc(self) -> discord.VoiceClient | None:
         return self.guild.voice_client  # type: ignore[return-value]
 
+    @property
+    def elapsed(self) -> float:
+        """Seconds of the current song played so far, not counting pauses."""
+        if self._play_started is None:
+            return 0.0
+        now = self._paused_at or time.monotonic()
+        return max(0.0, now - self._play_started - self._paused_total)
+
     async def play_next(self) -> None:
         vc = self.vc
         if not vc or not vc.is_connected():
             self.current = None
+            await self._remove_panel()
             return
         if not self.queue:
             self.current = None
+            await self._remove_panel()
             self._start_idle_timer()
             return
 
@@ -156,16 +182,18 @@ class GuildPlayer:
         track = self.queue.popleft()
         self.current = track
         try:
-            stream = await asyncio.to_thread(_stream_url, track.url)
+            info = await asyncio.to_thread(_stream_info, track.url)
         except Exception as e:
             log.warning("Failed to resolve %s: %s", track.url, e)
             await self._say(f"Could not play **{track.title}**, skipping.")
             if not await self._count_failure():
                 await self.play_next()
             return
+        track.thumbnail = info.get("thumbnail") or track.thumbnail
+        track.duration = track.duration or info.get("duration")
 
         source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(stream, **FFMPEG_OPTS), volume=self.volume
+            discord.FFmpegPCMAudio(info["url"], **FFMPEG_OPTS), volume=self.volume
         )
         started = time.monotonic()
 
@@ -176,7 +204,9 @@ class GuildPlayer:
             asyncio.run_coroutine_threadsafe(self._after_track(elapsed), self.bot.loop)
 
         vc.play(source, after=after)
-        await self._say(f"Now playing: **{track.title}** [{track.length}] - requested by {track.requester}")
+        self._play_started, self._paused_at, self._paused_total = started, None, 0.0
+        self.paused_by = None
+        await self._show_panel()
 
     async def _after_track(self, elapsed: float) -> None:
         skipped, self.skipping = self.skipping, False
@@ -200,6 +230,7 @@ class GuildPlayer:
         self._failures = 0
         self.queue.clear()
         self.current = None
+        await self._remove_panel()
         self._start_idle_timer()
         await self._say(
             f"{MAX_FAILURES_IN_ROW} songs in a row failed, so I stopped and cleared the queue. "
@@ -234,8 +265,179 @@ class GuildPlayer:
         self.queue.clear()
         self.current = None
         self._cancel_idle_timer()
+        await self._remove_panel()
         if self.vc:
             await self.vc.disconnect()
+
+    # Playback controls, shared by the commands and the panel's buttons.
+    # Each returns False when there's nothing to act on.
+
+    def pause(self, by: str) -> bool:
+        vc = self.vc
+        if not vc or not vc.is_playing():
+            return False
+        vc.pause()
+        self._paused_at = time.monotonic()
+        self.paused_by = by
+        return True
+
+    def resume(self) -> bool:
+        vc = self.vc
+        if not vc or not vc.is_paused():
+            return False
+        vc.resume()
+        if self._paused_at is not None:
+            self._paused_total += time.monotonic() - self._paused_at
+            self._paused_at = None
+        self.paused_by = None
+        return True
+
+    def skip(self) -> bool:
+        vc = self.vc
+        if not vc or not (vc.is_playing() or vc.is_paused()):
+            return False
+        self.skipping = True
+        vc.stop()  # triggers the after-callback, which plays the next track
+        return True
+
+    def shuffle(self) -> bool:
+        if len(self.queue) < 2:
+            return False
+        items = list(self.queue)
+        random.shuffle(items)
+        self.queue = deque(items)
+        return True
+
+    # The Now playing panel: one message per song, deleted when the next one starts.
+
+    def panel_embed(self) -> discord.Embed:
+        t = self.current
+        assert t is not None
+        embed = discord.Embed(title=t.title[:256], url=t.link, color=PANEL_COLOR)
+        embed.set_author(name=f"Paused by {self.paused_by}" if self.paused_by else "Now playing")
+        lines = [f"Added by **{discord.utils.escape_markdown(t.requester)}**"]
+        if self.vc and self.vc.channel:
+            lines.append(f"🔊 {self.vc.channel.mention}")
+        lines += [
+            f"Queue: `{len(self.queue)}` · Volume: `{round(self.volume * 100)}%`",
+            "",
+            _progress_bar(self.elapsed, t.duration),
+        ]
+        embed.description = "\n".join(lines)
+        if t.thumbnail:
+            embed.set_thumbnail(url=t.thumbnail)
+        return embed
+
+    async def _show_panel(self) -> None:
+        await self._remove_panel()
+        if not self.channel or not self.current:
+            return
+        self._controls = PlayerControls(self)
+        try:
+            self._panel = await self.channel.send(embed=self.panel_embed(), view=self._controls)
+        except discord.HTTPException:
+            self._panel = None
+            return
+        self._panel_task = self.bot.loop.create_task(self._refresh_panel_loop())
+
+    async def refresh_panel(self) -> None:
+        if not self._panel or not self.current or not self._controls:
+            return
+        self._controls.sync()
+        try:
+            await self._panel.edit(embed=self.panel_embed(), view=self._controls)
+        except discord.NotFound:
+            self._panel = None  # someone deleted it
+        except discord.HTTPException:
+            pass
+
+    async def _refresh_panel_loop(self) -> None:
+        while self._panel:
+            await asyncio.sleep(PANEL_REFRESH_SECONDS)
+            await self.refresh_panel()
+
+    async def _remove_panel(self) -> None:
+        if self._panel_task and not self._panel_task.done():
+            self._panel_task.cancel()
+        self._panel_task = None
+        if self._controls:
+            self._controls.stop()  # stop listening for button presses
+            self._controls = None
+        panel, self._panel = self._panel, None
+        if panel:
+            try:
+                await panel.delete()
+            except discord.HTTPException:
+                pass
+
+
+def _progress_bar(elapsed: float, total: int | None, width: int = 18) -> str:
+    if not total:
+        return f"`{_fmt_time(elapsed)}` ● live"
+    filled = min(width - 1, int(elapsed / total * width))
+    return f"`{_fmt_time(elapsed)}` {'━' * filled}●{'─' * (width - filled - 1)} `{_fmt_time(total)}`"
+
+
+class PlayerControls(discord.ui.View):
+    """Buttons under the Now playing panel. Like the commands, only listeners can use them."""
+
+    def __init__(self, player: GuildPlayer):
+        super().__init__(timeout=None)
+        self.player = player
+        self.sync()
+
+    def sync(self) -> None:
+        """Show Resume while paused and Pause while playing."""
+        paused = bool(self.player.vc and self.player.vc.is_paused())
+        self.pause_resume.label = "Resume" if paused else "Pause"
+        self.pause_resume.emoji = "▶️" if paused else "⏸️"
+        self.pause_resume.style = discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        vc = self.player.vc
+        if not vc or not vc.is_connected():
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return False
+        voice = getattr(interaction.user, "voice", None)
+        if not voice or voice.channel != vc.channel:
+            await interaction.response.send_message(f"Join {vc.channel.mention} to control playback.", ephemeral=True)
+            return False
+        return True
+
+    @staticmethod
+    def _name(interaction: discord.Interaction) -> str:
+        return discord.utils.escape_markdown(interaction.user.display_name)
+
+    @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        p = self.player
+        if not (p.resume() or p.pause(interaction.user.display_name)):
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        self.sync()
+        await interaction.response.edit_message(embed=p.panel_embed(), view=self)
+
+    @discord.ui.button(label="Skip", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        title = self.player.current.title if self.player.current else "the song"
+        if not self.player.skip():
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"{self._name(interaction)} skipped **{title}**.", delete_after=NOTE_SECONDS)
+
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.secondary)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            f"{self._name(interaction)} stopped playback and cleared the queue.", delete_after=NOTE_SECONDS
+        )
+        await self.player.stop()
+
+    @discord.ui.button(label="Shuffle", emoji="🔀", style=discord.ButtonStyle.secondary)
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.player.shuffle():
+            await interaction.response.send_message("Not enough songs in the queue to shuffle.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"{self._name(interaction)} shuffled the queue.", delete_after=NOTE_SECONDS)
 
 
 class Hydra(commands.Bot):
@@ -423,6 +625,8 @@ async def play(ctx: commands.Context, *, query: str) -> None:
     # against two quick play calls both starting playback.
     if player.current is None:
         await player.play_next()
+    else:
+        await player.refresh_panel()  # show the new queue size
 
 
 @bot.hybrid_command(aliases=["s"], help="Skip the current track")
@@ -430,11 +634,9 @@ async def play(ctx: commands.Context, *, query: str) -> None:
 @in_bot_voice_channel()
 async def skip(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
-    if not player or not player.vc or not (player.vc.is_playing() or player.vc.is_paused()):
+    if not player or not player.skip():
         await ctx.send("Nothing is playing.")
         return
-    player.skipping = True
-    player.vc.stop()  # triggers the after-callback, which plays the next track
     await ctx.send("Skipped.")
 
 
@@ -443,11 +645,11 @@ async def skip(ctx: commands.Context) -> None:
 @in_bot_voice_channel()
 async def pause(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
-    if not player or not player.vc or not player.vc.is_playing():
+    if not player or not player.pause(ctx.author.display_name):
         await ctx.send("Nothing is playing.")
         return
-    player.vc.pause()
     await ctx.send("Paused.")
+    await player.refresh_panel()
 
 
 @bot.hybrid_command(help="Resume playback")
@@ -455,11 +657,11 @@ async def pause(ctx: commands.Context) -> None:
 @in_bot_voice_channel()
 async def resume(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
-    if not player or not player.vc or not player.vc.is_paused():
+    if not player or not player.resume():
         await ctx.send("Nothing is paused.")
         return
-    player.vc.resume()
     await ctx.send("Resumed.")
+    await player.refresh_panel()
 
 
 @bot.hybrid_command(help="Stop playback, clear the queue, and leave")
@@ -516,6 +718,7 @@ async def volume(ctx: commands.Context, level: int) -> None:
     if player.vc and isinstance(player.vc.source, discord.PCMVolumeTransformer):
         player.vc.source.volume = player.volume
     await ctx.send(f"Volume set to {level}%.")
+    await player.refresh_panel()
 
 
 @bot.hybrid_command(help="Shuffle the queue")
@@ -523,12 +726,9 @@ async def volume(ctx: commands.Context, level: int) -> None:
 @in_bot_voice_channel()
 async def shuffle(ctx: commands.Context) -> None:
     player = _player_or_none(ctx)
-    if not player or len(player.queue) < 2:
+    if not player or not player.shuffle():
         await ctx.send("Not enough tracks to shuffle.")
         return
-    items = list(player.queue)
-    random.shuffle(items)
-    player.queue = deque(items)
     await ctx.send("Queue shuffled.")
 
 
