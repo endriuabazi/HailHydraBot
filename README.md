@@ -9,6 +9,7 @@ Every command works two ways: as a slash command (`/play`) and as a text command
 - Play a song from a YouTube link or search terms
 - Queue whole YouTube playlists (up to 50 tracks at a time)
 - Play Spotify tracks, albums and playlists (up to 50 tracks at a time). Optional; see [Spotify setup](#5-spotify-optional).
+- A **Now playing** panel for each song: title, who added it, voice channel, thumbnail, queue size, volume and a progress bar, with **Pause/Resume**, **Skip**, **Stop** and **Shuffle** buttons
 - Skip, pause, resume, stop, shuffle and change the volume
 - See the queue and the current track
 - Separate queue for each server
@@ -39,6 +40,8 @@ Notes:
 - To use `skip`, `pause`, `resume`, `stop`, `volume` or `shuffle`, you must be in the same voice channel as Hydra.
 - While Hydra is playing for people in one channel, `play` from another channel won't move it there. Join its channel to add songs.
 - `queue` and `nowplaying` work from anywhere.
+- The panel's buttons follow the same rule as the commands: only people in Hydra's voice channel can press them. Others get a private reply.
+- The panel's progress bar moves every 15 seconds, because Discord doesn't update messages live. When the next song starts, the old panel is deleted.
 - Commands work only in servers, not in DMs.
 - The text prefix is `h!` (or `H!`), so it doesn't clash with other bots that use `!`.
 
@@ -241,7 +244,8 @@ FFmpeg decodes the audio  --->  volume control  --->  discord.py sends it to the
 track ends  --->  play_next() starts the next track
 ```
 
-- **One player per server.** Each server gets a `GuildPlayer` with its own queue, current track, volume and text channel for "Now playing" messages.
+- **One player per server.** Each server gets a `GuildPlayer` with its own queue, current track, volume and text channel for the Now playing panel.
+- **Panel.** `GuildPlayer` posts the panel when a song starts, and edits it every 15 seconds to move the progress bar. Pause time isn't counted. The buttons (`PlayerControls`) and the commands call the same `pause`, `resume`, `skip` and `shuffle` methods, so they always behave the same.
 - **Search.** `yt-dlp` runs with `extract_flat`, so a playlist returns its track list quickly without loading every video. Plain text becomes a YouTube search, and Hydra queues the top result.
 - **Spotify.** `spotify.py` reads the track list from Spotify's Web API, logged in as the app owner's account. Each song is queued as a YouTube search for `artists - title`, and the search runs only when that song starts. A 50-song playlist queues instantly, and only the songs that actually play are looked up. Occasionally YouTube's top result is a different version, such as a live or cover recording.
 - **Audio URL at play time.** YouTube's direct audio links expire after a few hours. Hydra looks up the link only when a track starts, so a long queue never hits an expired link.
